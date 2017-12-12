@@ -1,5 +1,3 @@
-
-
 #ifndef INVIDX_HPP
 #define INVIDX_HPP
 
@@ -11,6 +9,25 @@
 #include "generic_rank.hpp"
 #include "bm25.hpp"
 #include "impact.hpp"
+#include <unordered_set>
+
+// Output the heap threshold at every scored document
+//#define HORIZON
+
+// Fill profile numbers
+//#define PROFILE
+
+#ifdef PROFILE
+
+  uint64_t qry_id = 0;
+  uint64_t postings_evaluated = 0;
+  uint64_t docs_fully_evaluated = 0;
+  uint64_t docs_added_to_heap = 0; 
+  double final_threshold = 0; 
+  uint64_t negation_passed = 0;
+  uint64_t negation_failed = 0;
+  std::unordered_set<uint64_t> unique_pivots;
+#endif
 
 using namespace sdsl;
 
@@ -263,6 +280,9 @@ public:
           score += (*itr)->list_max_score;
           ++next;
         }
+        #ifdef PROFILE
+          unique_pivots.insert(pivot_id);
+        #endif
         return {itr,score};
       }
       ++itr;
@@ -288,6 +308,9 @@ public:
     while (itr != end) {
       // Score the document if
       if ((*itr)->cur.docid() == doc_id) {
+        #ifdef PROFILE
+          ++postings_evaluated;
+        #endif  
         double contrib = ranker->calculate_docscore((*itr)->cur.freq(),
                                                    (*itr)->f_t,
                                                    W_d);
@@ -308,6 +331,9 @@ public:
         }
       } 
       else {
+        #ifdef PROFILE
+          ++docs_fully_evaluated;
+        #endif  
         break;
       }
       itr++;
@@ -315,20 +341,36 @@ public:
     // add if it is in the top-k
     if (heap.size() < k) {
       heap.push({doc_id,doc_score});
+      #ifdef PROFILE
+        ++docs_added_to_heap;
+      #endif    
     } 
     else {
       if (heap.top().score < doc_score) {
         heap.pop();
         heap.push({doc_id,doc_score});
+        #ifdef PROFILE
+          ++docs_added_to_heap;
+        #endif     
       }
     }
+    
+    #ifdef HORIZON
+      //std::cerr << k <<  ",score," << doc_id << "," << doc_score << "\n";
+      std::cerr << k << ",threshold," << doc_id << "," << heap.top().score << "\n";
+    #endif
+ 
     // resort
     sort_list_by_id(postings_lists);
-    if (heap.size()) {
+    if (heap.size() == k) {
+      #ifdef PROFILE
+        final_threshold = heap.top().score;
+      #endif
       return heap.top().score;
     }
     return 0.0f;
   }
+
 
   // Block-Max pivot evaluation
   double evaluate_pivot_bmw(std::vector<plist_wrapper*>& postings_lists,
@@ -349,6 +391,9 @@ public:
     while (itr != end) {
       // If we have the pivot, contribute the score
       if ((*itr)->cur.docid() == doc_id) {
+        #ifdef PROFILE
+          ++postings_evaluated;
+        #endif  
         double contrib = ranker->calculate_docscore((*itr)->cur.freq(),
                                                    (*itr)->f_t,
                                                    W_d);
@@ -371,6 +416,9 @@ public:
         }  
       } 
       else {
+        #ifdef PROFILE
+          ++docs_fully_evaluated;
+        #endif  
         break;
       }
       itr++;
@@ -378,22 +426,67 @@ public:
     // add if it is in the top-k
     if (heap.size() < k) {
       heap.push({doc_id,doc_score});
+      #ifdef PROFILE
+        ++docs_added_to_heap;
+      #endif     
     } 
     else {
       if (heap.top().score < doc_score) {
         heap.pop();
         heap.push({doc_id,doc_score});
+        #ifdef PROFILE
+
+          ++docs_added_to_heap;
+        #endif     
       }
     }
+       
+    #ifdef HORIZON
+      std::cerr << k << ",threshold," << doc_id << "," << heap.top().score << "\n";
+    #endif
+ 
     // resort
     sort_list_by_id(postings_lists);
-    if (heap.size()) {
+    if (heap.size() == k) {
+      #ifdef PROFILE
+        final_threshold = heap.top().score;
+      #endif
       return heap.top().score;
     }
     return 0.0f;
   }
 
+  // Given a list of postings which are negated and a doc_id, check if the
+  // doc_id is contained in any of the negated lists (that is, the doc contains
+  // negated terms).
+  bool is_negated(std::vector<plist_wrapper*>& negated_lists, 
+                  const uint64_t doc_id) {
+    // Ensure the negated list is sorted such that the first list has the
+    // smallest cursor, and so on.
+    sort_list_by_id(negated_lists);
+    auto itr = negated_lists.begin();
+    auto end = negated_lists.end();
 
+    // Iterate from smallest to largest ID until we find a cursor that is ahead
+    // of the doc_id of interest. At that point, we can stop.
+    while (itr != end && (*itr)->cur.docid() <= doc_id) {
+      // Skip to the target. This is done blockwise to avoid decompression
+      (*itr)->cur.skip_to_id(doc_id);
+      // Check the ID
+      if ((*itr)->cur != (*itr)->end && (*itr)->cur.docid() == doc_id) {
+        #ifdef PROFILE
+          ++negation_failed;
+        #endif  
+        return true; // This doc contains a negated term
+      }
+      ++itr; // Keep looking
+    }
+    #ifdef PROFILE
+      ++negation_passed;
+    #endif
+    return false; // This document is OK
+  }
+ 
   // Wand Disjunctive Algorithm
   result process_wand_disjunctive(std::vector<plist_wrapper*>& postings_lists,
                                   const size_t k) {
@@ -441,6 +534,66 @@ public:
     return res;
   }
 
+  // Wand Disjunctive Algorithm with negation included
+  result process_wand_disjunctive(std::vector<plist_wrapper*>& postings_lists,
+                                  std::vector<plist_wrapper*>& negated_lists,
+                                  const size_t k) {
+
+    result res;
+    // heap containing the top-k docs
+    std::priority_queue<doc_score,std::vector<doc_score>,
+                        std::greater<doc_score>> score_heap;
+
+    // init list processing 
+    double threshold = 0.0f;
+
+    // Initial Sort, get the pivot and its potential score
+    sort_list_by_id(postings_lists);
+    sort_list_by_id(negated_lists);
+    auto pivot_and_score = determine_candidate(postings_lists, threshold);
+    auto pivot_list = std::get<0>(pivot_and_score);
+    auto potential_score = std::get<1>(pivot_and_score);
+
+    // While our pivot doc is not the end of the PL
+    while (pivot_list != postings_lists.end()) {
+
+      // Now that we have a pivot that /might/ make the top-k, we need to
+      // make sure it is negated before scoring it
+      auto pivot_doc = (*pivot_list)->cur.docid();
+      bool negated = is_negated(negated_lists, pivot_doc);
+
+      // If the first posting ID is that of the pivot, evaluate!
+      if (postings_lists[0]->cur.docid() ==  pivot_doc && !negated) {
+          threshold = evaluate_pivot(postings_lists,
+                                     score_heap,
+                                     potential_score,
+                                     threshold,
+                                     k);
+      }
+      // Since this document is no longer worth considering, we skip forward
+      else if (negated) {
+        forward_lists(postings_lists, pivot_list, ++pivot_doc);
+      }
+      // We must forward the lists before the puvot up to our pivot doc  
+      else {
+        forward_lists(postings_lists,pivot_list,(*pivot_list)->cur.docid());
+      }
+      // Grab the next pivot and its potential score
+      pivot_and_score = determine_candidate(postings_lists, threshold);
+      pivot_list = std::get<0>(pivot_and_score);
+      potential_score = std::get<1>(pivot_and_score);
+
+    }
+
+    // return the top-k results
+    res.list.resize(score_heap.size());
+    for (size_t i=0;i<res.list.size();i++) {
+      auto min = score_heap.top(); score_heap.pop();
+      res.list[res.list.size()-1-i] = min;
+    }
+    return res;
+  }
+ 
   // Wand Conjunctive Algorithm
   result process_wand_conjunctive(std::vector<plist_wrapper*>& postings_lists,
                                   const size_t k) {
@@ -546,6 +699,143 @@ public:
     return res;
   }
 
+  // BlockMax Wand Disjunctive with negation included (bm check first)
+  result process_bmw_disjunctive_v1(std::vector<plist_wrapper*>& postings_lists,
+                                 std::vector<plist_wrapper*>& negated_lists,
+                                 const size_t k){   
+    result res;
+    // heap containing the top-k docs
+    std::priority_queue<doc_score,std::vector<doc_score>,
+                        std::greater<doc_score>> score_heap;
+    
+    // init list processing , grab first pivot and potential score
+    double threshold = 0;
+    sort_list_by_id(postings_lists);
+    sort_list_by_id(negated_lists);
+    auto pivot_and_score = determine_candidate(postings_lists, threshold);
+    auto pivot_list = std::get<0>(pivot_and_score);
+
+    // While we have got documents left to evaluate
+    while (pivot_list != postings_lists.end()) {
+      uint64_t candidate_id = (*pivot_list)->cur.docid();
+      
+      // Second level candidate check
+      auto candidate_and_score = potential_candidate(postings_lists, pivot_list,
+                                          threshold, candidate_id);
+      auto candidate = std::get<0>(candidate_and_score);
+      auto potential_score = std::get<1>(candidate_and_score);
+      // If the document is still a candidate from BM scores
+      if (candidate) {
+
+        // V1: NOW we check the negation (after the BM check)
+        bool negated = is_negated(negated_lists, candidate_id);
+
+        // If lists are aligned for pivot, score the doc
+        if (postings_lists[0]->cur.docid() == candidate_id && !negated) {
+          threshold = evaluate_pivot_bmw(postings_lists, score_heap,
+                                     potential_score, threshold, k);
+        }
+        // This doc contains negated terms, so we skip ahead
+        else if (negated) {
+          forward_lists(postings_lists, pivot_list, ++candidate_id);
+        }
+        // Need to forward list before the pivot 
+        else {
+          forward_lists(postings_lists,pivot_list,candidate_id);
+        }
+      }
+      // Use the knowledge that current block-max config can not yield a
+      // solution, and skip to the next possible fruitful configuration
+      else {
+        forward_lists_bmw(postings_lists,pivot_list,candidate_id); 
+      }
+      // Grab a new pivot and keep going!
+      pivot_and_score = determine_candidate(postings_lists,
+                                            threshold);
+      pivot_list = std::get<0>(pivot_and_score);
+      potential_score = std::get<1>(pivot_and_score);
+      
+    }
+    // return the top-k results
+    res.list.resize(score_heap.size());
+    for (size_t i=0;i<res.list.size();i++) {
+      auto min = score_heap.top(); score_heap.pop();
+      res.list[res.list.size()-1-i] = min;
+    }
+    return res;
+  }
+
+   // BlockMax Wand Disjunctive with negation included (negation check first)
+  result process_bmw_disjunctive_v2(std::vector<plist_wrapper*>& postings_lists,
+                                 std::vector<plist_wrapper*>& negated_lists,
+                                 const size_t k){   
+    result res;
+    // heap containing the top-k docs
+    std::priority_queue<doc_score,std::vector<doc_score>,
+                        std::greater<doc_score>> score_heap;
+    
+    // init list processing , grab first pivot and potential score
+    double threshold = 0;
+    sort_list_by_id(postings_lists);
+    sort_list_by_id(negated_lists);
+    auto pivot_and_score = determine_candidate(postings_lists, threshold);
+    auto pivot_list = std::get<0>(pivot_and_score);
+
+    // While we have got documents left to evaluate
+    while (pivot_list != postings_lists.end()) {
+      uint64_t candidate_id = (*pivot_list)->cur.docid();
+
+      // V2: We check for negation before we check the BM score
+      bool negated = is_negated(negated_lists, candidate_id);
+      // This doc contains negated terms, so we skip ahead
+      if (negated) {
+        forward_lists(postings_lists, pivot_list, ++candidate_id);
+
+        // Grab a new pivot and go from the top of the loop
+        pivot_and_score = determine_candidate(postings_lists,
+                                            threshold);
+        pivot_list = std::get<0>(pivot_and_score);
+        continue;
+      }
+
+      // Second level candidate check
+      auto candidate_and_score = potential_candidate(postings_lists, pivot_list,
+                                          threshold, candidate_id);
+      auto candidate = std::get<0>(candidate_and_score);
+      auto potential_score = std::get<1>(candidate_and_score);
+      // If the document is still a candidate from BM scores
+      if (candidate) {
+        // If lists are aligned for pivot, score the doc
+        if (postings_lists[0]->cur.docid() == candidate_id) {
+          threshold = evaluate_pivot_bmw(postings_lists, score_heap,
+                                     potential_score, threshold, k);
+        }
+        // Need to forward list before the pivot 
+        else {
+          forward_lists(postings_lists,pivot_list,candidate_id);
+        }
+      }
+      // Use the knowledge that current block-max config can not yield a
+      // solution, and skip to the next possible fruitful configuration
+      else {
+        forward_lists_bmw(postings_lists,pivot_list,candidate_id); 
+      }
+      // Grab a new pivot and keep going!
+      pivot_and_score = determine_candidate(postings_lists,
+                                            threshold);
+      pivot_list = std::get<0>(pivot_and_score);
+      potential_score = std::get<1>(pivot_and_score);
+      
+    }
+    // return the top-k results
+    res.list.resize(score_heap.size());
+    for (size_t i=0;i<res.list.size();i++) {
+      auto min = score_heap.top(); score_heap.pop();
+      res.list[res.list.size()-1-i] = min;
+    }
+    return res;
+  }
+
   // BlockMax Wand Conjunctive
   result process_bmw_conjunctive(std::vector<plist_wrapper*>& postings_lists,
                                 const size_t k){   
@@ -603,35 +893,124 @@ public:
     return res;
   }
 
+  // Basic tool for dumping the union of the negated and disjunction terms
+  // for a given query.
+  void union_count(const std::vector<query_token>& qry, const size_t id) {
+    std::unordered_set<uint64_t> negated;
+    std::unordered_set<uint64_t> disjunctive;
+
+    std::vector<plist_wrapper> pl_data(qry.size());
+    std::vector<plist_wrapper> negated_data(qry.size());
+
+    size_t j=0,n=0;
+    for (const auto& qry_token : qry) {
+      if (qry_token.negated) {
+        negated_data[n] =  plist_wrapper(m_postings_lists[qry_token.token_id]);
+        ++n;
+      }
+      else {
+        pl_data[j] = plist_wrapper(m_postings_lists[qry_token.token_id]);
+        ++j;
+      }
+    }
+
+    negated_data.resize(n);
+    pl_data.resize(j);
+
+    // Run through negated lists
+    for (size_t i = 0; i < negated_data.size(); ++i) {
+      auto& pl = negated_data[i];
+      while (pl.cur != pl.end) {
+        auto doc_id = pl.cur.docid();
+        negated.insert(doc_id);
+        ++(pl.cur);
+      } 
+    }
+    // Run through disjunctive lists
+    for (size_t i = 0; i < pl_data.size(); ++i) {
+      auto& pl = pl_data[i];
+      while (pl.cur != pl.end) {
+        auto doc_id = pl.cur.docid();
+        disjunctive.insert(doc_id);
+        ++(pl.cur);
+      } 
+    }
+
+    // Calculate the intersection of these lists
+    size_t intersection = 0;
+    for (auto it = negated.begin(); it != negated.end(); ++it) {
+      if(disjunctive.find(*it) != disjunctive.end())
+        ++intersection;
+    }
+
+    std::cerr << id << "," << disjunctive.size()
+                    << "," << negated.size()
+                    << "," << intersection << std::endl;
+    
+  }
 
   result search(const std::vector<query_token>& qry, const size_t k,
                 const index_form t_index_type,
-                const query_traversal t_index_traversal) {
+                const query_traversal t_index_traversal,
+                bool version_two = false) {
+
+    #ifdef PROFILE
+    postings_evaluated = 0;
+    docs_fully_evaluated = 0;
+    docs_added_to_heap = 0; 
+    final_threshold = 0; 
+    negation_passed = 0;
+    negation_failed = 0;
+    unique_pivots.clear();
+    #endif
 
     m_conjunctive_max = 0.0f; // Reset for new query
+
     std::vector<plist_wrapper> pl_data(qry.size());
     std::vector<plist_wrapper*> postings_lists;
-    size_t j=0;
+    std::vector<plist_wrapper> negated_data(qry.size());
+    std::vector<plist_wrapper*> negated_lists;
+
+    size_t j=0,n=0;
     for (const auto& qry_token : qry) {
-      pl_data[j] = plist_wrapper(m_postings_lists[qry_token.token_id]);
-      postings_lists.emplace_back(&(pl_data[j]));
-      m_conjunctive_max += pl_data[j].list_max_score;
-      ++j;
+      if (qry_token.negated) {
+        negated_data[n] =  plist_wrapper(m_postings_lists[qry_token.token_id]);
+        negated_lists.emplace_back(&(negated_data[n]));
+        ++n;
+      }
+      else {
+        pl_data[j] = plist_wrapper(m_postings_lists[qry_token.token_id]);
+        postings_lists.emplace_back(&(pl_data[j]));
+        m_conjunctive_max += pl_data[j].list_max_score;
+        ++j;
+      }
     }
+
+    negated_data.resize(n);
+    pl_data.resize(j);
+
+    result res;
 
     // Select and run query
     if (t_index_type == BMW) {
-      if (t_index_traversal == OR)
-        return process_bmw_disjunctive(postings_lists,k);
+      if (t_index_traversal == OR && n == 0)
+        res = process_bmw_disjunctive(postings_lists,k);
+      else if (t_index_traversal == OR && n > 0 && !version_two)
+        res = process_bmw_disjunctive_v1(postings_lists,negated_lists,k);
+      else if (t_index_traversal == OR && n > 0 && version_two)
+        res = process_bmw_disjunctive_v2(postings_lists,negated_lists,k);
       else if (t_index_traversal == AND)
-        return process_bmw_conjunctive(postings_lists,k);
+        res = process_bmw_conjunctive(postings_lists,k);
     }
 
+
     else if (t_index_type == WAND) {
-      if (t_index_traversal == OR)
-        return process_wand_disjunctive(postings_lists,k);
+      if (t_index_traversal == OR && n == 0)
+        res = process_wand_disjunctive(postings_lists,k);
+      else if (t_index_traversal == OR && n > 0)
+        res = process_wand_disjunctive(postings_lists,negated_lists,k);
       else if (t_index_traversal == AND)
-        return process_wand_conjunctive(postings_lists,k);
+        res = process_wand_conjunctive(postings_lists,k);
     }
     
     else {
@@ -639,6 +1018,16 @@ public:
                 << std::endl;
       exit(EXIT_FAILURE);
     }
+    #ifdef PROFILE
+    res.postings_evaluated = postings_evaluated;
+    res.docs_fully_evaluated = docs_fully_evaluated;
+    res.docs_added_to_heap = docs_added_to_heap; 
+    res.final_threshold = final_threshold; 
+    res.negation_passed = negation_passed;
+    res.negation_failed = negation_failed;
+    res.unique_pivots = unique_pivots.size();
+    #endif
+    return res; 
   }
 
 };

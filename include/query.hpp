@@ -26,25 +26,25 @@ struct doc_score {
 struct result {
   std::vector<doc_score> list;
   uint64_t qry_id = 0;
-  uint64_t wt_search_space = 0;
-  uint64_t wt_nodes = 0;
-  uint64_t postings_evaluated = 0; // Sum calls to "evaluate_pivot"
-  uint64_t postings_total = 0; // Sum of lengths of postings lists from query
+  uint64_t postings_evaluated = 0;
   uint64_t docs_fully_evaluated = 0;
   uint64_t docs_added_to_heap = 0; 
   double final_threshold = 0; // Final top-k heap threshold
+  uint64_t negation_passed = 0;
+  uint64_t negation_failed = 0;
+  uint64_t unique_pivots = 0;
 };
 
 struct query_token{
     uint64_t token_id;
     std::string token_str;
     uint64_t f_qt;
+    bool negated = false;
 	query_token(const uint64_t id,
               const std::string str,
-              uint64_t f) : token_id(id), token_str(str), 
-              f_qt(f) 
-    {
-    }
+              uint64_t f, bool neg) : token_id(id), token_str(str), 
+              f_qt(f) , negated(neg) {}
+   
 };
 
 using query_t = std::tuple<uint64_t,std::vector<query_token>>;
@@ -81,7 +81,16 @@ struct query_parser {
         return {id_mapping,reverse_id_mapping};
     }
 
-    static std::tuple<bool,uint64_t,std::vector<uint64_t>> 
+    // Used for parsing
+    struct temp_term {
+      temp_term (uint64_t _id, bool _neg, uint64_t _count) :
+                id(_id), negated(_neg), count(_count) {}
+      uint64_t id;
+      bool negated;
+      uint64_t count;
+    };
+
+    static std::tuple<bool,uint64_t,std::vector<temp_term>> 
         map_to_ids(const std::unordered_map<std::string,uint64_t>& id_mapping,
                    std::string query_str,bool only_complete,bool integers)
     {
@@ -90,16 +99,26 @@ struct query_parser {
         auto qry_id = std::stoull(qryid_str);
         auto qry_content = query_str.substr(id_sep_pos+1);
 
-        std::vector<uint64_t> ids;
+        std::vector<temp_term> ids;
         std::istringstream qry_content_stream(qry_content);
         for(std::string qry_token; std::getline(qry_content_stream,qry_token,' ');) {
+            bool negated = false;
             if(integers) {
                 uint64_t id = std::stoull(qry_token);
-                ids.push_back(id);
+                ids.emplace_back(id, false, 1);
             } else {
+    
+                // Check for negation operator
+                if(qry_token.at(0) == '-') {
+                  qry_token.erase(0,1);
+                  negated = true;
+                  std::cerr << "Query: " << qry_id << " has negated term: " 
+                            << qry_token << std::endl;
+                }
+      
                 auto id_itr = id_mapping.find(qry_token);
                 if(id_itr != id_mapping.end()) {
-                    ids.push_back(id_itr->second);
+                    ids.emplace_back(id_itr->second, negated, 1);
                 } else {
                     std::cerr << "ERROR: could not find '" 
                               << qry_token << "' in the dictionary." 
@@ -127,10 +146,26 @@ struct query_parser {
         auto qry_id = std::get<1>(mapped_qry);
         
         if(parse_ok) {
-            std::unordered_map<uint64_t,uint64_t> qry_set;
+            std::unordered_map<uint64_t,temp_term> qry_set;
             const auto& tids = std::get<2>(mapped_qry);
-            for(const auto& tid : tids) {
-                qry_set[tid] += 1;
+            // For each term, search for the next repeat of this term
+            // if found, ensure semantics are correct
+            for (size_t i = 0; i < tids.size(); ++i) {
+              auto tmp = tids[i];
+              auto it = qry_set.find(tmp.id);
+              if (it != qry_set.end()) {
+                if (it->second.negated != tmp.negated) {
+                  std::cerr << "Query " << qry_id << " has broken semantics. "
+                            << " Please fix. Exiting.\n";
+                  exit(EXIT_FAILURE);
+                }
+                else {
+                  it->second.count += 1;
+                }
+              }
+              else {
+                qry_set.insert({tmp.id, tmp});
+              }
             }
             std::vector<query_token> query_tokens;
             size_t index = 0;
@@ -141,7 +176,8 @@ struct query_parser {
                 if(rmitr != reverse_mapping.end()) {
                     term_str = rmitr->second;
                 }
-                query_tokens.emplace_back(term,term_str,qry_tok.second);
+                query_tokens.emplace_back(term,term_str,qry_tok.second.count,
+                                          qry_tok.second.negated);
                 ++index;
             }
             query_t q(qry_id,query_tokens);
